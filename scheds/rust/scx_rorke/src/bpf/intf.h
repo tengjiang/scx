@@ -1,6 +1,8 @@
 #ifndef __INTF_H
 #define __INTF_H
 
+#define MAX_CPUS 128
+#define MAX_VMS 16
 
 #ifndef __VMLINUX_H__
 typedef unsigned char u8;

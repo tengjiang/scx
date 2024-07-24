@@ -1,17 +1,54 @@
+/* SPDX-License-Identifier: GPL-2.0 */
+/*
+ * Rorke: A special purpose scheduler for hypervisors
+ * TODO: Add a proper description
+ *
+ * Copyright(C) 2024 Vahab Jabrayilov<vjabrayilov@cs.columbia.edu>
+ * Influenced by the scx_central scheduler
+ */
 #include <scx/common.bpf.h>
 #include "intf.h"
 
 char _license[] SEC("license") = "GPL";
 
-UEI_DEFINE(uei);
+enum {
+	FALLBACK_DSQ_ID = 0,
+	US_TO_NS = 1000LLU,
+	/* TODO: make timer interval configurable */
+	TIMER_INTERVAL_NS = 100 * US_TO_NS,
+};
 
 /*
- * const volatiles are set during initialization
+ * Init parameters
+ * const volatiles are set again during initialization
+ * here we assign values just to pass the verifier
  */
+const volatile s32 central_cpu = 0;
+const volatile u32 nr_cpus = 1;
+const volatile u32 nr_vms = 1;
+const volatile u64 slice_ns = SCX_SLICE_DFL;
+const volatile u32 debug = 0;
+const volatile u64 vms[MAX_VMS];
+const volatile u64 cpu_to_vm[MAX_CPUS];
 
-const volatile u32 debug;
+bool timer_pinned = true;
+u64 nr_total, nr_locals, nr_queued, nr_lost_pids;
+u64 nr_timers, nr_dispatches, nr_mismatches, nr_retries;
+u64 nr_overflows;
 
-static u64 slice_ns = SCX_SLICE_DFL;
+/* Exit information */
+UEI_DEFINE(uei);
+
+struct central_timer {
+	struct bpf_timer timer;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, struct central_timer);
+} central_timer SEC(".maps");
 
 s32 BPF_STRUCT_OPS(rorke_select_cpu, struct task_struct *p, s32 prev_cpu,
 		   u64 wake_flags)
@@ -54,9 +91,93 @@ void BPF_STRUCT_OPS(rorke_exit_task, struct task_struct *p,
 {
 }
 
+/*
+ * At every TIMER_INTERVAL_NS, preempts all CPUs other than central.
+ */
+static int central_timerfn(void *map, int *key, struct bpf_timer *timer)
+{
+	u64 now = bpf_ktime_get_ns();
+	u64 nr_to_kick = nr_queued;
+	s32 i, curr_cpu;
+
+	curr_cpu = bpf_get_smp_processor_id();
+	if (timer_pinned && (curr_cpu != central_cpu)) {
+		scx_bpf_error(
+			"Central Timer ran on CPU %d, not central CPU %d\n",
+			curr_cpu, central_cpu);
+		return 0;
+	}
+
+	/* TODO: check removing nr_timers */
+	bpf_for(i, 0, nr_cpus)
+	{
+		s32 cpu = (nr_timers + i) % nr_cpus;
+
+		if (cpu == central_cpu)
+			continue;
+
+		if (scx_bpf_dsq_nr_queued(FALLBACK_DSQ_ID) ||
+		    scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpu))
+			;
+		else if (nr_to_kick)
+			nr_to_kick--;
+		else
+			continue;
+
+		scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
+	}
+
+	bpf_timer_start(timer, TIMER_INTERVAL_NS, BPF_F_TIMER_CPU_PIN);
+	__sync_fetch_and_add(&nr_timers, 1);
+	return 0;
+}
+
 s32 BPF_STRUCT_OPS_SLEEPABLE(rorke_init)
 {
-	return 0;
+	u32 key = 0, i;
+	struct bpf_timer *timer;
+	int ret;
+
+	ret = scx_bpf_create_dsq(FALLBACK_DSQ_ID, -1);
+	if (ret)
+		return ret;
+
+	/* Create DSQ per VM */
+	bpf_for(i, 0, nr_vms)
+	{
+		ret = scx_bpf_create_dsq(vms[i], -1);
+		if (ret) {
+			scx_bpf_error("failed to create DSQ for VM %d", vms[i]);
+			return ret;
+		}
+	}
+
+    /* Setup timer */
+	timer = bpf_map_lookup_elem(&central_timer, &key);
+	if (!timer)
+		return -ESRCH;
+
+	if (bpf_get_smp_processor_id() != central_cpu) {
+		scx_bpf_error("init from non-central cpu");
+		return EINVAL;
+	}
+
+	bpf_timer_init(timer, &central_timer, CLOCK_MONOTONIC);
+	bpf_timer_set_callback(timer, central_timerfn);
+
+	ret = bpf_timer_start(timer, TIMER_INTERVAL_NS, BPF_F_TIMER_CPU_PIN);
+	/*
+     * BPF_F_TIMER_CPU_PIN is not supported in all kernels (>= 6.7). If we're
+     * running on an older kernel, it'll return -EINVAL
+     * Retry w/o BPF_F_TIMER_CPU_PIN
+     */
+	if (ret == -EINVAL) {
+		timer_pinned = false;
+		ret = bpf_timer_start(timer, TIMER_INTERVAL_NS, 0);
+	}
+	if (ret)
+		scx_bpf_error("bpf_timer_start failed (%d)", ret);
+	return ret;
 }
 
 void BPF_STRUCT_OPS(rorke_exit, struct scx_exit_info *ei)
@@ -64,7 +185,14 @@ void BPF_STRUCT_OPS(rorke_exit, struct scx_exit_info *ei)
 	UEI_RECORD(uei, ei);
 }
 
-SCX_OPS_DEFINE(rorke, .select_cpu = (void *)rorke_select_cpu,
+SCX_OPS_DEFINE(rorke,
+	       /*
+		    * We are offloading all scheduling decisions to the central CPU
+		    * and thus being the last task on a given CPU doesn't mean
+		    * anything special. Enqueue the last tasks like any other tasks.
+		    */
+	       .flags = SCX_OPS_ENQ_LAST,
+	       .select_cpu = (void *)rorke_select_cpu,
 	       .enqueue = (void *)rorke_enqueue,
 	       .dispatch = (void *)rorke_dispatch,
 	       .runnable = (void *)rorke_runnable,
