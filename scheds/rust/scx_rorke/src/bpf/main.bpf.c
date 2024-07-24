@@ -53,11 +53,38 @@ struct {
 s32 BPF_STRUCT_OPS(rorke_select_cpu, struct task_struct *p, s32 prev_cpu,
 		   u64 wake_flags)
 {
-	return 0;
+	/*
+     * Steer wakeups to the central CPU to avoid disturbing other CPUs.
+     * NOTE: This is a simple implementation. A more sophisticated approach
+     * would check to directly steer to the previously assigned CPU if idle.
+     */
+	return central_cpu;
 }
 
 void BPF_STRUCT_OPS(rorke_enqueue, struct task_struct *p, u64 enq_flags)
 {
+	s32 pid = p->pid;
+	s32 tgid = p->tgid;
+
+	__sync_fetch_and_add(&nr_total, 1);
+
+	/*
+	 * Push per-cpu kthreads at the head of local dsq's and preempt the
+	 * corresponding CPU. This ensures that e.g. ksoftirqd isn't blocked
+	 * behind other threads which is necessary for forward progress
+	 * guarantee as we depend on the BPF timer which may run from ksoftirqd.
+	 */
+	if ((p->flags & PF_KTHREAD) && p->nr_cpus_allowed == 1) {
+		__sync_fetch_and_add(&nr_locals, 1);
+		scx_bpf_dispatch(p, SCX_DSQ_LOCAL, SCX_SLICE_INF,
+				 enq_flags | SCX_ENQ_PREEMPT);
+		return;
+	}
+
+    /* TODO: error checking */
+    scx_bpf_dispatch(p, tgid, SCX_SLICE_INF, enq_flags);
+
+    __sync_fetch_and_add(&nr_queued, 1);
 }
 
 void BPF_STRUCT_OPS(rorke_dispatch, s32 cpu, struct task_struct *prev)
@@ -152,7 +179,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(rorke_init)
 		}
 	}
 
-    /* Setup timer */
+	/* Setup timer */
 	timer = bpf_map_lookup_elem(&central_timer, &key);
 	if (!timer)
 		return -ESRCH;
