@@ -83,6 +83,7 @@ pub struct Cpu {
     min_freq: usize,
     max_freq: usize,
     trans_lat_ns: usize,
+    llc_id: usize,
 }
 
 impl Cpu {
@@ -104,6 +105,11 @@ impl Cpu {
     /// Get the transition latency of the CPU in nanoseconds
     pub fn trans_lat_ns(&self) -> usize {
         self.trans_lat_ns
+    }
+
+    /// Get the LLC id of the this Cpu
+    pub fn llc_id(&self) -> usize {
+        self.llc_id
     }
 }
 
@@ -153,6 +159,15 @@ impl Cache {
     pub fn span(&self) -> &Cpumask {
         &self.span
     }
+
+    /// Get the map of all CPUs for this LLC.
+    pub fn cpus(&self) -> BTreeMap<usize, Cpu> {
+        let mut cpus = BTreeMap::new();
+        for (_, core) in self.cores() {
+            cpus.append(&mut core.cpus.clone());
+        }
+        cpus
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -171,6 +186,17 @@ impl Node {
     /// Get the map of LLCs inside this NUMA node
     pub fn llcs(&self) -> &BTreeMap<usize, Cache> {
         &self.llcs
+    }
+
+    /// Get the map of all CPUs for this NUMA node.
+    pub fn cpus(&self) -> BTreeMap<usize, Cpu> {
+        let mut cpus = BTreeMap::new();
+        for (_, llc) in &self.llcs {
+            for (_, core) in llc.cores() {
+                cpus.append(&mut core.cpus.clone());
+            }
+        }
+        cpus
     }
 
     /// Get a Cpumask of all CPUs in this NUMA node
@@ -414,6 +440,7 @@ fn create_insert_cpu(cpu_id: usize, node: &mut Node, online_mask: &Cpumask) -> R
             min_freq: min_freq,
             max_freq: max_freq,
             trans_lat_ns: trans_lat_ns,
+            llc_id: llc_id,
         },
     );
 

@@ -56,29 +56,20 @@ enum consts {
 	LAVD_TIME_INFINITY_NS		= SCX_SLICE_INF,
 	LAVD_MAX_RETRY			= 4,
 
-	LAVD_TARGETED_LATENCY_NS	= (10 * NSEC_PER_MSEC),
-	LAVD_SLICE_MIN_NS		= (30 * NSEC_PER_USEC), /* min time slice */
-	LAVD_SLICE_MAX_NS		= ( 3 * NSEC_PER_MSEC), /* max time slice */
+	LAVD_TARGETED_LATENCY_NS	= (20ULL * NSEC_PER_MSEC),
+	LAVD_SLICE_MIN_NS		= (300ULL * NSEC_PER_USEC), /* min time slice */
+	LAVD_SLICE_MAX_NS		= (3ULL * NSEC_PER_MSEC), /* max time slice */
 	LAVD_SLICE_UNDECIDED		= SCX_SLICE_INF,
-	LAVD_LOAD_FACTOR_ADJ		= 6, /* adjustment for better estimation */
-	LAVD_LOAD_FACTOR_MAX		= (20 * 1000),
-	LAVD_LOAD_FACTOR_FT		= 4, /* factor to stretch the time line */
 
 	LAVD_LC_FREQ_MAX		= 1000000,
 	LAVD_LC_RUNTIME_MAX		= LAVD_TARGETED_LATENCY_NS,
 	LAVD_LC_RUNTIME_SHIFT		= 10,
 
-	LAVD_BOOST_RANGE		= 40, /* 100% of nice range */
-	LAVD_BOOST_WAKEUP_LAT		= 1,
-	LAVD_SLICE_BOOST_MAX_FT		= 2, /* maximum additional 2x of slice */
-	LAVD_SLICE_BOOST_MAX_STEP	= 8, /* 8 slice exhausitions in a row */
-	LAVD_GREEDY_RATIO_MAX		= USHRT_MAX,
-	LAVD_LAT_PRIO_NEW		= 10,
-	LAVD_LAT_PRIO_IDLE		= USHRT_MAX,
-	LAVD_LAT_WEIGHT_FT		= 88761,
+	LAVD_SLICE_BOOST_MAX_FT		= 3, /* maximum additional 2x of slice */
+	LAVD_SLICE_BOOST_MAX_STEP	= 6, /* 8 slice exhausitions in a row */
+	LAVD_GREEDY_RATIO_NEW		= 2000,
 
-	LAVD_ELIGIBLE_TIME_LAT_FT	= 16,
-	LAVD_ELIGIBLE_TIME_MAX		= (100 * NSEC_PER_USEC),
+	LAVD_ELIGIBLE_TIME_MAX		= (1ULL * LAVD_TIME_ONE_SEC),
 
 	LAVD_CPU_UTIL_MAX		= 1000, /* 100.0% */
 	LAVD_CPU_UTIL_MAX_FOR_CPUPERF	= 850, /* 85.0% */
@@ -86,19 +77,20 @@ enum consts {
 	LAVD_CPU_ID_NONE		= ((u32)-1),
 	LAVD_CPU_ID_MAX			= 512,
 
-	LAVD_PREEMPT_KICK_LAT_PRIO	= 15,
-	LAVD_PREEMPT_KICK_MARGIN	= (2 * NSEC_PER_USEC),
-	LAVD_PREEMPT_TICK_MARGIN	= (1 * NSEC_PER_USEC),
+	LAVD_PREEMPT_KICK_MARGIN	= (1ULL * NSEC_PER_MSEC),
+	LAVD_PREEMPT_TICK_MARGIN	= (100ULL * NSEC_PER_USEC),
 
-	LAVD_SYS_STAT_INTERVAL_NS	= (25 * NSEC_PER_MSEC),
-	LAVD_TC_PER_CORE_MAX_CTUIL	= 500, /* maximum per-core CPU utilization */
-	LAVD_TC_NR_ACTIVE_MIN		= 1, /* num of mininum active cores */
-	LAVD_TC_NR_OVRFLW		= 1, /* num of overflow cores */
-	LAVD_TC_CPU_PIN_INTERVAL	= (100 * NSEC_PER_MSEC),
-	LAVD_TC_CPU_PIN_INTERVAL_DIV	= (LAVD_TC_CPU_PIN_INTERVAL /
+	LAVD_SYS_STAT_INTERVAL_NS	= (25ULL * NSEC_PER_MSEC),
+	LAVD_CC_PER_CORE_MAX_CTUIL	= 500, /* maximum per-core CPU utilization */
+	LAVD_CC_NR_ACTIVE_MIN		= 1, /* num of mininum active cores */
+	LAVD_CC_NR_OVRFLW		= 1, /* num of overflow cores */
+	LAVD_CC_CPU_PIN_INTERVAL	= (100ULL * NSEC_PER_MSEC),
+	LAVD_CC_CPU_PIN_INTERVAL_DIV	= (LAVD_CC_CPU_PIN_INTERVAL /
 					   LAVD_SYS_STAT_INTERVAL_NS),
 
-	LAVD_GLOBAL_DSQ			= 0,
+	LAVD_LATENCY_CRITICAL_DSQ	= 0, /* a global DSQ for latency-criticcal tasks */
+	LAVD_REGULAR_DSQ		= 1, /* a global DSQ for non-latency-criticcal tasks */
+	LAVD_DSQ_STARVE_TIMEOUT		= (5ULL * NSEC_PER_USEC),
 };
 
 /*
@@ -107,18 +99,13 @@ enum consts {
 struct sys_stat {
 	volatile u64	last_update_clk;
 	volatile u64	util;		/* average of the CPU utilization */
-	volatile u64	load_factor;	/* system load in % (1000 = 100%) for running all runnables within a LAVD_TARGETED_LATENCY_NS */
 
-	volatile u64	load_ideal;	/* average ideal load of runnable tasks */
 	volatile u64	load_actual;	/* average actual load of runnable tasks */
+	volatile u64	avg_svc_time;	/* average service time per task */
 
 	volatile u32	avg_lat_cri;	/* average latency criticality (LC) */
 	volatile u32	max_lat_cri;	/* maximum latency criticality (LC) */
-	volatile u32	min_lat_cri;	/* minimum latency criticality (LC) */
 	volatile u32	thr_lat_cri;	/* latency criticality threshold for kicking */
-
-	volatile s32	inc1k_low;	/* increment from low LC to priority mapping */
-	volatile s32	inc1k_high;	/* increment from high LC to priority mapping */
 
 	volatile u32	avg_perf_cri;	/* average performance criticality */
 
@@ -140,9 +127,9 @@ struct cpu_ctx {
 	/*
 	 * Information used to keep track of load
 	 */
-	volatile u64	load_ideal;	/* ideal loaf of runnable tasks */
 	volatile u64	load_actual;	/* actual load of runnable tasks */
 	volatile u64	load_run_time_ns; /* total runtime of runnable tasks */
+	volatile u64	tot_svc_time;	/* total service time on a CPU */
 	volatile u64	last_kick_clk;	/* when the CPU was kicked */
 
 	/*
@@ -155,7 +142,6 @@ struct cpu_ctx {
 	 * Information used to keep track of latency criticality
 	 */
 	volatile u32	max_lat_cri;	/* maximum latency criticality */
-	volatile u32	min_lat_cri;	/* minimum latency criticality */
 	volatile u32	sum_lat_cri;	/* sum of latency criticality */
 	volatile u32	sched_nr;	/* number of schedules */
 
@@ -168,7 +154,7 @@ struct cpu_ctx {
 	 * Information of a current running task for preemption
 	 */
 	volatile u64	stopping_tm_est_ns; /* estimated stopping time */
-	volatile u16	lat_prio;	/* latency priority */
+	volatile u16	lat_cri;	/* latency criticality */
 	volatile u8	is_online;	/* is this CPU online? */
 	s32		cpu_id;		/* cpu id */
 
@@ -183,6 +169,7 @@ struct cpu_ctx {
 	 * Fields for core compaction
 	 *
 	 */
+	u16		capacity;	/* CPU capacity based on 1000 */
 	struct bpf_cpumask __kptr *tmp_a_mask;	/* temporary cpu mask */
 	struct bpf_cpumask __kptr *tmp_o_mask;	/* temporary cpu mask */
 } __attribute__((aligned(CACHELINE_SIZE)));
@@ -206,6 +193,7 @@ struct task_ctx {
 
 	u64	wake_freq;		/* waking-up frequency in a second */
 	u64	load_actual;		/* task load derived from run_time and run_freq */
+	u64	svc_time;		/* total CPU time consumed for this task */
 
 	/*
 	 * Task deadline and time slice
@@ -216,9 +204,9 @@ struct task_ctx {
 	u64	slice_ns;		/* time slice */
 	u32	greedy_ratio;		/* task's overscheduling ratio compared to its nice priority */
 	u32	lat_cri;		/* calculated latency criticality */
+	u32	starv_cri;		/* calculated starvation criticality */
 	volatile s32 victim_cpu;
 	u16	slice_boost_prio;	/* how many times a task fully consumed the slice */
-	u16	lat_prio;		/* latency priority */
 
 	/*
 	 * Task's performance criticality
@@ -232,7 +220,6 @@ struct task_ctx_x {
 	u16	static_prio;	/* nice priority */
 	u32	cpu_id;		/* where a task ran */
 	u64	cpu_util;	/* cpu utilization in [0..100] */
-	u64	sys_load_factor; /* system load factor in [0..100..] */
 	u32	avg_perf_cri;	/* average performance criticality */
 	u32	avg_lat_cri;	/* average latency criticality */
 	u32	nr_active;	/* number of active cores */

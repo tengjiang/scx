@@ -320,6 +320,7 @@ struct TaskInfo {
     pid: i32,
     load: OrderedFloat<f64>,
     dom_mask: u64,
+    preferred_dom_mask: u64,
     migrated: Cell<bool>,
     is_kworker: bool,
 }
@@ -677,26 +678,17 @@ impl<'a, 'b> LoadBalancer<'a, 'b> {
         }
         dom.queried_tasks = true;
 
-        // Read active_pids and update write_idx and gen.
-        //
-        // XXX - We can't read task_ctx inline because self.skel.bss()
-        // borrows mutably and thus conflicts with self.skel.maps().
+        // Read active_pids and update read_idx and gen.
         const MAX_PIDS: u64 = bpf_intf::consts_MAX_DOM_ACTIVE_PIDS as u64;
         let active_pids = &mut self.skel.bss_mut().dom_active_pids[dom.id];
-        let mut pids = vec![];
-
         let (mut ridx, widx) = (active_pids.read_idx, active_pids.write_idx);
+        active_pids.read_idx = active_pids.write_idx;
+        active_pids.gen += 1;
+
+        let active_pids = &self.skel.bss().dom_active_pids[dom.id];
         if widx - ridx > MAX_PIDS {
             ridx = widx - MAX_PIDS;
         }
-
-        for idx in ridx..widx {
-            let pid = active_pids.pids[(idx % MAX_PIDS) as usize];
-            pids.push(pid);
-        }
-
-        active_pids.read_idx = active_pids.write_idx;
-        active_pids.gen += 1;
 
         // Read task_ctx and load.
         let load_half_life = self.skel.rodata().load_half_life;
@@ -704,8 +696,9 @@ impl<'a, 'b> LoadBalancer<'a, 'b> {
         let task_data = maps.task_data();
         let now_mono = now_monotonic();
 
-        for pid in pids.iter() {
-            let key = unsafe { std::mem::transmute::<i32, [u8; 4]>(*pid) };
+        for idx in ridx..widx {
+            let pid = active_pids.pids[(idx % MAX_PIDS) as usize];
+            let key = unsafe { std::mem::transmute::<i32, [u8; 4]>(pid) };
 
             if let Some(task_data_elem) = task_data.lookup(&key, libbpf_rs::MapFlags::ANY)? {
                 let task_ctx =
@@ -732,9 +725,10 @@ impl<'a, 'b> LoadBalancer<'a, 'b> {
 
                 dom.tasks.insert(
                     TaskInfo {
-                        pid: *pid,
+                        pid,
                         load: OrderedFloat(load),
                         dom_mask: task_ctx.dom_mask,
+                        preferred_dom_mask: task_ctx.preferred_dom_mask,
                         migrated: Cell::new(false),
                         is_kworker: task_ctx.is_kworker,
                     },
@@ -748,21 +742,13 @@ impl<'a, 'b> LoadBalancer<'a, 'b> {
     // Find the first candidate pid which hasn't already been migrated and
     // can run in @pull_dom.
     fn find_first_candidate<'d, I>(
-        tasks_by_load: I,
-        pull_dom: u32,
-        skip_kworkers: bool,
+        tasks_by_load: I
     ) -> Option<&'d TaskInfo>
     where
         I: IntoIterator<Item = &'d TaskInfo>,
     {
         match tasks_by_load
-            .into_iter()
-            .skip_while(|task| {
-                task.migrated.get()
-                    || (task.dom_mask & (1 << pull_dom) == 0)
-                    || (skip_kworkers && task.is_kworker)
-            })
-            .next()
+            .into_iter().next()
         {
             Some(task) => Some(task),
             None => None,
@@ -776,6 +762,7 @@ impl<'a, 'b> LoadBalancer<'a, 'b> {
         &mut self,
         (push_dom, to_push): (&mut Domain, f64),
         (pull_dom, to_pull): (&mut Domain, f64),
+        task_filter: impl Fn(&TaskInfo, u32) -> bool,
         to_xfer: f64,
     ) -> Result<Option<f64>> {
         let to_pull = to_pull.abs();
@@ -790,24 +777,38 @@ impl<'a, 'b> LoadBalancer<'a, 'b> {
         // migratable task while scanning left from $to_xfer and the
         // counterpart while scanning right and picking the better of the
         // two.
-        let tasks = std::mem::take(&mut push_dom.tasks).into_vec();
+        let pull_dom_id: u32 = pull_dom.id.try_into().unwrap();
+        let tasks: Vec<TaskInfo> = std::mem::take(&mut push_dom.tasks)
+            .into_vec()
+            .into_iter()
+            .filter(
+                |task|
+                task.dom_mask
+                & (1 << pull_dom_id) == 1
+                || (self.skip_kworkers && task.is_kworker)
+                || task.migrated.get()
+            )
+            .collect();
+
         let (task, new_imbal) = match (
             Self::find_first_candidate(
                 tasks
                     .as_slice()
                     .iter()
-                    .filter(|x| x.load <= OrderedFloat(to_xfer))
+                    .filter(|x| {
+                        x.load <= OrderedFloat(to_xfer)
+                        && task_filter(x, pull_dom_id)
+                    })
                     .rev(),
-                pull_dom.id.try_into().unwrap(),
-                self.skip_kworkers,
             ),
             Self::find_first_candidate(
                 tasks
                     .as_slice()
                     .iter()
-                    .filter(|x| x.load >= OrderedFloat(to_xfer)),
-                pull_dom.id.try_into().unwrap(),
-                self.skip_kworkers,
+                    .filter(|x| {
+                        x.load >= OrderedFloat(to_xfer)
+                        && task_filter(x, pull_dom_id)
+                    }),
             ),
         ) {
             (None, None) => return Ok(None),
@@ -873,9 +874,19 @@ impl<'a, 'b> LoadBalancer<'a, 'b> {
                     pull_node.domains.insert(pull_dom);
                     break;
                 }
-                let transferred = self.try_find_move_task((&mut push_dom, push_imbal),
+                let mut transferred = self.try_find_move_task((&mut push_dom, push_imbal),
                                                           (&mut pull_dom, pull_imbal),
+                                                          |task: &TaskInfo, pull_dom:u32| -> bool {
+                                                              (task.preferred_dom_mask & (1 << pull_dom)) > 0
+                                                          },
                                                           xfer)?;
+                if transferred.is_none() {
+                    transferred = self.try_find_move_task((&mut push_dom, push_imbal),
+                                                          (&mut pull_dom, pull_imbal),
+                                                          |_task: &TaskInfo, _pull_dom:u32| -> bool {true},
+                                                          xfer)?;
+                }
+
                 pullers.push(pull_dom);
                 if let Some(transferred) = transferred {
                     pushed = transferred;
@@ -1035,9 +1046,19 @@ impl<'a, 'b> LoadBalancer<'a, 'b> {
                     bail!("Node {} pull dom {} had imbal {}", node.id, pull_dom.id, pull_imbal);
                 }
                 let xfer = push_dom.xfer_between(&pull_dom);
-                let transferred = self.try_find_move_task((&mut push_dom, push_imbal),
+                let mut transferred = self.try_find_move_task((&mut push_dom, push_imbal),
                                                           (&mut pull_dom, pull_imbal),
+                                                          |task: &TaskInfo, pull_dom:u32| -> bool {
+                                                              (task.preferred_dom_mask & (1 << pull_dom)) > 0
+                                                          },
                                                           xfer)?;
+                if transferred.is_none() {
+                    transferred = self.try_find_move_task((&mut push_dom, push_imbal),
+                                                          (&mut pull_dom, pull_imbal),
+                                                          |_task: &TaskInfo, _pull_dom:u32| -> bool {true},
+                                                          xfer)?;
+                }
+
                 if let Some(transferred) = transferred {
                     if transferred <= 0.0f64 {
                         bail!("Expected nonzero load transfer")
